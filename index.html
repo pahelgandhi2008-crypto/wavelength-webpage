@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hand → Light Wavelength</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; width: 100%; height: 100%; overflow: hidden;
+      background: #05050b; color: white; font-family: Inter, system-ui, sans-serif;
+    }
+    #stage {
+      position: fixed; inset: 0; overflow: hidden;
+      background: radial-gradient(circle at center, #151525 0%, #05050b 70%);
+      transition: background 120ms linear;
+    }
+    #video {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      object-fit: cover; transform: scaleX(-1);
+      opacity: .12; filter: saturate(1.2) contrast(1.1);
+    }
+    #glow {
+      position: absolute; inset: -20%;
+      pointer-events: none;
+      background: radial-gradient(circle at 50% 50%, rgba(130,60,255,.8) 0%, rgba(40,0,100,.25) 22%, transparent 58%);
+      mix-blend-mode: screen;
+      transition: background 120ms linear, opacity 120ms linear;
+    }
+    #handsLayer { position:absolute; inset:0; pointer-events:none; }
+    .handGlow {
+      position:absolute; width:110px; height:110px; border-radius:50%;
+      transform:translate(-50%,-50%);
+      background: radial-gradient(circle, #fff 0%, var(--c) 14%, transparent 68%);
+      filter: blur(2px); opacity:.95;
+      box-shadow: 0 0 55px 20px var(--c);
+    }
+    #ui {
+      position:absolute; inset:0; display:flex; flex-direction:column;
+      align-items:center; justify-content:center; pointer-events:none;
+      text-align:center; padding:20px;
+    }
+    #title { font-size:clamp(18px,2vw,30px); letter-spacing:.15em; text-transform:uppercase; opacity:.8; }
+    #wavelength {
+      font-size:clamp(64px,12vw,150px); font-weight:800; line-height:.9;
+      text-shadow: 0 0 35px currentColor, 0 0 90px currentColor;
+    }
+    #nm { font-size:.28em; font-weight:500; margin-left:8px; }
+    #colorName { font-size:clamp(20px,3vw,38px); font-weight:600; margin-top:16px; }
+    #hint {
+      position:absolute; bottom:28px; left:50%; transform:translateX(-50%);
+      font-size:14px; opacity:.7; max-width:90vw;
+    }
+    #status {
+      position:absolute; top:22px; right:24px; padding:9px 13px;
+      border:1px solid rgba(255,255,255,.18); border-radius:999px;
+      background:rgba(0,0,0,.3); backdrop-filter:blur(8px); font-size:13px;
+    }
+    #start {
+      pointer-events:auto; cursor:pointer; border:0; border-radius:999px;
+      padding:13px 22px; color:white; background:rgba(255,255,255,.14);
+      border:1px solid rgba(255,255,255,.3); font-size:16px;
+      backdrop-filter:blur(10px);
+    }
+    #start.hidden { display:none; }
+    #loading { margin-top:16px; opacity:.65; font-size:13px; }
+  </style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <div id="glow"></div>
+  <div id="handsLayer"></div>
+
+  <div id="ui">
+    <div id="title">Hand → Visible Light</div>
+    <div id="wavelength">—<span id="nm">nm</span></div>
+    <div id="colorName">Show two hands to begin</div>
+    <button id="start">Enable Camera</button>
+    <div id="loading"></div>
+  </div>
+  <div id="status">Camera off</div>
+  <div id="hint">Bring your hands together → violet/blue · move apart → orange/red · touch hands → white</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+
+<script>
+const video = document.getElementById('video');
+const stage = document.getElementById('stage');
+const glow = document.getElementById('glow');
+const wavelengthEl = document.getElementById('wavelength');
+const colorNameEl = document.getElementById('colorName');
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('start');
+const loadingEl = document.getElementById('loading');
+const handsLayer = document.getElementById('handsLayer');
+
+let camera = null;
+let running = false;
+
+// Calibration range in normalized camera coordinates.
+// Distances below MIN_DIST map to violet; above MAX_DIST map to red.
+const MIN_DIST = 0.10;
+const MAX_DIST = 0.75;
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+function wavelengthToRGB(w) {
+  // Approximate visible-spectrum conversion.
+  let r=0,g=0,b=0;
+  if (w >= 380 && w < 440) { r=-(w-440)/(440-380); g=0; b=1; }
+  else if (w < 490) { r=0; g=(w-440)/(490-440); b=1; }
+  else if (w < 510) { r=0; g=1; b=-(w-510)/(510-490); }
+  else if (w < 580) { r=(w-510)/(580-510); g=1; b=0; }
+  else if (w < 645) { r=1; g=-(w-645)/(645-580); b=0; }
+  else if (w <= 700) { r=1; g=0; b=0; }
+
+  // Reduce brightness near spectrum edges, and convert to CSS-friendly RGB.
+  let factor = 1;
+  if (w < 420) factor = 0.72 + 0.28*(w-380)/40;
+  if (w > 645) factor = 0.72 + 0.28*(700-w)/55;
+  return [Math.round(r*255*factor), Math.round(g*255*factor), Math.round(b*255*factor)];
+}
+
+function colorName(w) {
+  if (w < 450) return "Violet / Blue";
+  if (w < 495) return "Blue";
+  if (w < 570) return "Green";
+  if (w < 590) return "Yellow";
+  if (w < 625) return "Orange";
+  return "Red";
+}
+
+function distance(a,b) {
+  const dx = a.x-b.x, dy = a.y-b.y;
+  return Math.hypot(dx,dy);
+}
+
+function midpoint(a,b) {
+  return {x:(a.x+b.x)/2, y:(a.y+b.y)/2};
+}
+
+function renderHands(landmarks) {
+  handsLayer.innerHTML = "";
+  landmarks.forEach((hand, i) => {
+    const wrist = hand[0];
+    const x = (1-wrist.x)*innerWidth;
+    const y = wrist.y*innerHeight;
+    const dot = document.createElement("div");
+    dot.className = "handGlow";
+    dot.style.left = x + "px";
+    dot.style.top = y + "px";
+    dot.style.setProperty("--c", i === 0 ? "rgba(120,80,255,.95)" : "rgba(255,100,70,.95)");
+    handsLayer.appendChild(dot);
+  });
+}
+
+function onResults(results) {
+  const hands = results.multiHandLandmarks || [];
+  renderHands(hands);
+
+  if (hands.length < 2) {
+    wavelengthEl.firstChild.nodeValue = "—";
+    colorNameEl.textContent = hands.length === 1 ? "One hand detected — show your other hand" : "Show two hands";
+    statusEl.textContent = running ? "Tracking" : "Camera off";
+    glow.style.background = "radial-gradient(circle at 50% 50%, rgba(120,80,255,.45), transparent 58%)";
+    return;
+  }
+
+  // Use wrist positions as a stable, simple measure of separation.
+  const d = distance(hands[0][0], hands[1][0]);
+  const p = clamp((d - MIN_DIST)/(MAX_DIST - MIN_DIST), 0, 1);
+
+  // Close = violet (~380 nm), apart = red (~700 nm).
+  const wavelength = Math.round(380 + p * 320);
+
+  // Touch detection uses wrist distance plus palm-center distance for robustness.
+  const palmA = hands[0][9], palmB = hands[1][9];
+  const palmD = distance(palmA, palmB);
+  const touching = d < 0.13 || palmD < 0.11;
+
+  if (touching) {
+    wavelengthEl.firstChild.nodeValue = "∞";
+    colorNameEl.textContent = "WHITE — HANDS TOGETHER";
+    stage.style.background = "radial-gradient(circle at center, #ffffff 0%, #dfeaff 22%, #101018 72%)";
+    glow.style.background = "radial-gradient(circle at 50% 50%, rgba(255,255,255,1) 0%, rgba(255,255,255,.7) 14%, transparent 60%)";
+    wavelengthEl.style.color = "#fff";
+    return;
+  }
+
+  const [r,g,b] = wavelengthToRGB(wavelength);
+  const css = `rgb(${r},${g},${b})`;
+  wavelengthEl.firstChild.nodeValue = wavelength;
+  colorNameEl.textContent = colorName(wavelength);
+  wavelengthEl.style.color = css;
+  stage.style.background = `radial-gradient(circle at center, rgba(${r},${g},${b},.36) 0%, rgba(5,5,11,.98) 72%)`;
+  glow.style.background = `radial-gradient(circle at 50% 50%, rgba(${r},${g},${b},.95) 0%, rgba(${r},${g},${b},.22) 20%, transparent 62%)`;
+  statusEl.textContent = `Distance: ${d.toFixed(3)} · Live`;
+}
+
+async function startCamera() {
+  startBtn.classList.add("hidden");
+  loadingEl.textContent = "Loading hand tracking…";
+  try {
+    const hands = new Hands({
+      locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+    hands.onResults(onResults);
+
+    camera = new Camera(video, {
+      onFrame: async () => { await hands.send({image: video}); },
+      width: 1280,
+      height: 720
+    });
+    await camera.start();
+    running = true;
+    statusEl.textContent = "Tracking";
+    loadingEl.textContent = "";
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = "Camera error";
+    loadingEl.textContent = "Could not start camera. Use HTTPS or localhost and allow camera access.";
+    startBtn.classList.remove("hidden");
+  }
+}
+
+startBtn.addEventListener("click", startCamera);
+</script>
+</body>
+</html>
